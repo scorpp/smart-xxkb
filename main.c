@@ -2,12 +2,14 @@
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
 #include <err.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
+#include <sys/select.h>
 #include "lru.h"
 
-#define MAXSTR 1000
+#define MAXSTR 500
 #define PER_WINDOW_CACHE_SIZE 50
 
 typedef struct {
@@ -24,17 +26,13 @@ Atom MY_KBD_DATA;
 Display *display = NULL;
 XErrorHandler defaultXErrorHandler = NULL;
 ActiveWindow prevActive;
+volatile sig_atomic_t acceptEvents = True;
 
 
 void
 terminate_handler(int signum) {
     warnx("Caught SIGTERM|SIGINT, cleaning up and exiting...");
-    XCloseDisplay(display);
-    free(prevActive.windowTitle);
-    lru_free(prevActive.groupCache);
-
-//    warnx("exiting...");
-//    exit(0);
+    acceptEvents = False;
 }
 
 Display *
@@ -78,7 +76,8 @@ get_active_window(Display *display) {
     Atom actualType;
     int actualFormat;
     unsigned long nitems, bytes;
-    unsigned long *activeWindowId;
+    Window *activeWindowId = NULL;
+    Window result = 0;
     int status;
     Window root = DefaultRootWindow(display);
 
@@ -96,13 +95,14 @@ get_active_window(Display *display) {
             &bytes,
             (unsigned char **) &activeWindowId
     );
-    if (status != Success) {
+    if (status == Success && activeWindowId) {
+        result = *activeWindowId;
+        XFree(activeWindowId);
+    } else {
         warnx("Cannot get id of current active window");
-        return 0;
     }
 
-//    warnx("active window=%lu", *activeWindowId);
-    return *activeWindowId;
+    return result;
 }
 
 int
@@ -163,25 +163,50 @@ set_string_property(Display *display, Window window, Atom property, char *serial
 void
 persist_old_cache() {
     if (prevActive.groupCache) {
+        Window dummy_root, dummy_parent;
+        Window *dummy_children = NULL;
+        unsigned int dummy_nchildren;
         char *serialized = lru_serialize(prevActive.groupCache);
-        set_string_property(display, prevActive.window, MY_KBD_DATA, serialized);
+
+        XGrabServer(display);  // Lock X server to prevent window destruction
+         // Check if window still exists
+        if (XQueryTree(display,
+                       prevActive.window,
+                       &dummy_root,
+                       &dummy_parent,
+                       &dummy_children,
+                       &dummy_nchildren)) {
+            if (dummy_children) {
+                XFree(dummy_children);
+            }
+            
+            set_string_property(display, prevActive.window, MY_KBD_DATA, serialized);
+        }
+        XUngrabServer(display);
 
         lru_free(prevActive.groupCache);
         free(serialized);
-
         prevActive.groupCache = NULL;
     }
 }
 
 void
 init_new_cache(Window activeWindow) {
-    char *str;
+    char *str = NULL;
+    LruCache *newCache = NULL;
 
-    get_string_property(display, activeWindow, MY_KBD_DATA, &str);
-    prevActive.groupCache = str
-            ? lru_deserialize(str)
-            : lru_new(PER_WINDOW_CACHE_SIZE);
-    XFree(str);
+    if (get_string_property(display, activeWindow, MY_KBD_DATA, &str) == Success) {
+        if (str != NULL) {
+            newCache = lru_deserialize(str);
+            XFree(str);
+        }
+    }
+    
+    if (newCache == NULL) {
+        newCache = lru_new(PER_WINDOW_CACHE_SIZE);
+    }
+
+    prevActive.groupCache = newCache;
 }
 
 int
@@ -214,20 +239,31 @@ handle_change_common(Display *display, Window activeWindow) {
         changed = True;
     }
 
-    char *activeTitle;
+    char *activeTitle = NULL;
     int status;
 
     status = get_window_title(display, activeWindow, &activeTitle);
 
-    if (prevActive.window != activeWindow
-            || NULL == prevActive.windowTitle
-            || (status == Success && 0 != strcmp(activeTitle, prevActive.windowTitle))) {
-        strcpy(prevActive.windowTitle, activeTitle);
-        warnx("Window title of active window %lu to %s", activeWindow, activeTitle);
-        changed = True;
+    if (status == Success && activeTitle != NULL) {
+        if (prevActive.window != activeWindow
+                || NULL == prevActive.windowTitle
+                || (0 != strcmp(activeTitle, prevActive.windowTitle))) {
+            strncpy(prevActive.windowTitle, activeTitle, MAXSTR - 1);
+            prevActive.windowTitle[MAXSTR - 1] = '\0'; // Ensure null termination
+            warnx("Window title of active window %lu to %s", activeWindow, activeTitle);
+            changed = True;
+        }
+    } else {
+        // Handle the case where we couldn't get the window title
+        if (prevActive.windowTitle != NULL) {
+            prevActive.windowTitle[0] = '\0';  // Set to empty string
+        }
+        warnx("Could not get window title for window %lu", activeWindow);
     }
 
-    XFree(activeTitle);
+    if (activeTitle != NULL) {
+        XFree(activeTitle);
+    }
     return changed;
 }
 
@@ -236,6 +272,7 @@ handle_change_window(Display *display) {
     lru_value_t group;
 
     if (0 == lru_get(prevActive.groupCache, prevActive.windowTitle, &group)) {
+        warnx("Restoring previous state %d", group);
         XkbLockGroup(display, XkbUseCoreKbd, group);
 
     } else {
@@ -274,11 +311,24 @@ int
 main() {
     int xkbEventType;
 
+    memset(&prevActive, 0, sizeof(ActiveWindow));
     prevActive.windowTitle = (char *) malloc(MAXSTR);
+    if (prevActive.windowTitle == NULL) {
+        warnx("Failed to allocate memory for window title");
+        exit(1);
+    }
+    prevActive.windowTitle[0] = '\0';
+    prevActive.window = 0;
+    prevActive.groupCache = NULL;
+
     display = xkb_open_display(&xkbEventType);
 
-    // TODO signal(SIGTERM, terminate_handler);
-//    signal(SIGINT, terminate_handler);
+    fd_set fds;
+    struct timeval tv;
+    int x11_fd = ConnectionNumber(display);
+
+    signal(SIGTERM, terminate_handler);
+    signal(SIGINT, terminate_handler);
 
     defaultXErrorHandler = XSetErrorHandler(my_x_error_handler);
 
@@ -290,6 +340,10 @@ main() {
     NET_WM_NAME       = XInternAtom(display, "_NET_WM_NAME", True);
     WM_NAME           = XInternAtom(display, "WM_NAME", True);
     MY_KBD_DATA       = XInternAtom(display, "X_TAB_KBD_GRP", False);
+    if (NET_ACTIVE_WINDOW == None || NET_WM_NAME == None || WM_NAME == None || MY_KBD_DATA == None) {
+        warnx("Failed to initialize required X atoms");
+        exit(1);
+    }
 
     Window root = DefaultRootWindow(display);
     warnx("Root window id %lu", root);
@@ -298,32 +352,66 @@ main() {
 
     handle_change_common(display, get_active_window(display));
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wmissing-noreturn"
-    while (True) {
+    while (acceptEvents) {
+        // Setup select() to wait for X events        
+        FD_ZERO(&fds);
+        FD_SET(x11_fd, &fds);
+        
+        tv.tv_sec = 1;  // 1 second timeout
+        tv.tv_usec = 0;
+        
+        // Wait for X Event or a Timer
+        int num_ready_fds = select(x11_fd + 1, &fds, NULL, NULL, &tv);
+        if (num_ready_fds < 0) {
+            if (errno == EINTR) continue;  // Interrupted by signal
+            warnx("Select error: %s", strerror(errno));
+            break;
+        }
+        
+
         XkbEvent event;
-        XNextEvent(display, (XEvent *) &event);
 
-        if (event.type == PropertyNotify) {
-            XPropertyEvent *xproperty = &event.core.xproperty;
-            if (xproperty->atom == NET_ACTIVE_WINDOW) {
-                if (handle_change_common(display, get_active_window(display)))
-                    handle_change_window(display);
+        while (XPending(display)) {
+            XNextEvent(display, (XEvent *) &event);
+            if (!acceptEvents) break;  // Check again after potentially blocking call
+            
+            if (event.type == PropertyNotify) {
+                XPropertyEvent *xproperty = &event.core.xproperty;
+                if (xproperty->atom == NET_ACTIVE_WINDOW) {
+                    warnx("Active window changed");
+                    if (handle_change_common(display, get_active_window(display)))
+                        handle_change_window(display);
 
-            } else if (xproperty->atom == NET_WM_NAME || xproperty->atom == WM_NAME) {
-                if (handle_change_common(display, xproperty->window))
-                    handle_change_title(display);
-            }
-//            warnx("Property change event, atom=%lu, serial=%lu, window=%lu",
-//                  xproperty.atom, xproperty.serial, xproperty.window);
-        } else if (event.type == xkbEventType) {
-            if (event.any.xkb_type == XkbStateNotify) {
-                XkbStateNotifyEvent *state = &event.state;
-                warnx("XkbStateNotify base_group=%d, group=%d, locked_group=%d, latched_group=%d",
-                      state->base_group, state->group, state->locked_group, state->latched_group);
-                handle_change_xkb_group(display, state);
+                } else if (xproperty->atom == NET_WM_NAME || xproperty->atom == WM_NAME) {
+                    warnx("Window title changed");
+                    if (handle_change_common(display, xproperty->window))
+                        handle_change_title(display);
+                }
+    //            warnx("Property change event, atom=%lu, serial=%lu, window=%lu",
+    //                  xproperty.atom, xproperty.serial, xproperty.window);
+            } else if (event.type == xkbEventType) {
+                if (event.any.xkb_type == XkbStateNotify) {
+                    XkbStateNotifyEvent *state = &event.state;
+                    warnx("XkbStateNotify base_group=%d, group=%d, locked_group=%d, latched_group=%d",
+                        state->base_group, state->group, state->locked_group, state->latched_group);
+                    handle_change_xkb_group(display, state);
+                }
             }
         }
     }
-#pragma clang diagnostic pop
+
+    if (display != NULL) {
+        XCloseDisplay(display);
+        display = NULL;
+    }
+    if (prevActive.windowTitle != NULL) {
+        free(prevActive.windowTitle);
+        prevActive.windowTitle = NULL;
+    }
+    if (prevActive.groupCache != NULL) {
+        lru_free(prevActive.groupCache);
+        prevActive.groupCache = NULL;
+    }
+
+    exit(EXIT_SUCCESS);
 }
