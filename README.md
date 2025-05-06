@@ -2,32 +2,28 @@
 Per-window-tab keyboard layout manager
 
 ## Problem Statement
-On modern PC desktop there are multiple modality levels: virtual desktops, 
-windows, tabs, etc.
+Modern PC desktops often involve multiple levels of modality: virtual desktops, windows, tabs, and more.
 
-It's also quite common to communicate with diff people around the globe, use
-diff languages.
+It's also common to communicate with people from around the world, using 
+different languages.
 
-And all that in the same time!
+And often, all of this happens simultaneously!
 
-Usual keyboard layout managers only remember layout per app or per window at
-best.
+Most keyboard layout managers only remember the layout per application or, at best, per window.
 
-Imaging taking part in several conversations in slack, all using it's own
-language. Or editing a work email (in English) and chatting with your team in
-their native languae (say, Ukrainian) in same browser window.
+Imagine participating in several conversations on Slack, each in a different 
+language. Or writing a work email in English while chatting with your team in their native language (e.g., Ukrainian)
+in the same browser window.
 
-## Working principle
-**smart-xxkb** tracks changes to keyboard layouts and window titles and 
-associates the two.
+## Working Principle
+**smart-xxkb** tracks changes to keyboard layouts and window titles, associating the two.
 
-Once you switch keyboard layout it's associated with your current window AND
-it's title (e.g. tab).
+When you switch keyboard layouts, it remembers the layout for your current 
+window and its title (e.g., a browser tab).
 
-If window title changes and there's a known layout associated with that title
+If the window title changes and a layout is already associated with that title, 
 the keyboard layout is automatically switched to the remembered one.
 
 ## Limitations
-- Unfortunately, not all apps expose their inner context to window title. In
-  such cases you will get a regular per-window layout experience.
-
+- Unfortunately, not all applications expose their internal context in the window title. In such cases, you will
+  experience a standard per-window layout behavior.
